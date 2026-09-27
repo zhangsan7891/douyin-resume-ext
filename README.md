@@ -48,7 +48,7 @@
 **方式二：克隆**
 
 ```bash
-git clone https://github.com/zhangsan7891/douyin-resume-ext.git
+git clone https://github.com/<你的用户名>/douyin-resume-ext.git
 ```
 
 然后同样按上面的 2~5 步加载。
@@ -93,6 +93,44 @@ douyin-resume-ext/
 ```
 
 改完文件后，去 `chrome://extensions` 点该扩展的**刷新**，再刷新抖音页面即生效。
+
+## 更新日志
+
+### v1.1.0
+
+修复「重进之后找不到原视频」的问题。根因有两个：
+
+1. **存了带参数的脏地址**。在推荐流里刷到的视频，URL 形如
+   `douyin.com/?modal_id=xxx&from=xxx&extra=xxx`，直接存下来后，下次打开的是推荐页，
+   抖音不会自动弹回该视频。
+2. **唯一标识会串**。首页刷到的视频若 URL 里没有 `modal_id`，兜底逻辑会存成
+   `url:https://www.douyin.com/`，导致所有首页刷到的视频互相覆盖。
+
+修复方式：
+
+- 新增 aweme_id 挖掘：优先从 URL 取，其次从页面 DOM 取
+  （`data-e2e` 容器属性 → video 元素向上追溯 → 扫描页面内联数据），
+  再拿不到才退回剥离脏参数的 URL
+- 存记录时统一写入干净的详情页地址 `douyin.com/video/<id>`
+- 续看改为跨页面传递（写入 `chrome.storage`，新页面读取），并按 aweme_id 匹配
+- 启动时自动修复旧记录：补 aweme_id、换成干净地址、按 aweme_id 去重
+- 新增 SPA 路由监听（抖音切换视频不刷新页面）
+
+### v1.0.0
+
+首个版本。自动记录进度、悬浮球续看、删除单条、清空全部。
+
+## 排查问题
+
+如果发现不记录、跳转不对、悬浮球不出现，见 [调试指南](调试指南.md)。
+
+最常用的一条命令（在抖音页面按 F12 → Console）：
+
+```js
+chrome.storage.local.get(null, r => console.table(r.dyrs_records))
+```
+
+会打印所有记录。重点看 `url` 列是否为干净的 `douyin.com/video/<id>` 形式。
 
 ## 参与贡献
 

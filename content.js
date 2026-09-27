@@ -30,18 +30,109 @@
     return h > 0 ? h + ":" + p(m) + ":" + p(s) : m + ":" + p(s);
   }
 
-  /** 生成视频唯一 key：优先用 aweme_id，退回 URL */
-  function getVideoKey() {
+  /**
+   * 从 URL 里挖 aweme_id（视频真实 ID）
+   * 覆盖三种形态：
+   *   /video/7123456789...
+   *   /?modal_id=7123456789...
+   *   /user/xxx?modal_id=7123456789...
+   */
+  function getAwemeIdFromUrl() {
     const url = new URL(location.href);
-    // 抖音视频页通常形如 /video/7xxxxxxxxxxxxxxxxxx
     const m = location.pathname.match(/\/video\/(\d+)/);
-    if (m) return "aweme:" + m[1];
-    // 部分页面用 modal_id 参数
-    const mid = url.searchParams.get("modal_id");
-    if (mid) return "aweme:" + mid;
-    // 兜底：去掉易变参数
+    if (m) return m[1];
+    const mid =
+      url.searchParams.get("modal_id") ||
+      url.searchParams.get("aweme_id") ||
+      url.searchParams.get("vid");
+    if (mid && /^\d+$/.test(mid)) return mid;
+    return null;
+  }
+
+  /**
+   * 从页面 DOM 里挖 aweme_id
+   * 抖音会在页面里挂大量 data-e2e 属性和脚本数据
+   */
+  function getAwemeIdFromDom() {
+    // 1. 常见属性
+    const attrs = [
+      "[data-e2e=\"feed-video\"]",
+      "[data-e2e=\"video-item\"]",
+      "[data-e2e=\"recommend-list-item-container\"]",
+      "div[data-video-id]",
+      "[data-aweme-id]",
+    ];
+    for (const sel of attrs) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      const id =
+        el.getAttribute("data-video-id") ||
+        el.getAttribute("data-aweme-id") ||
+        el.getAttribute("data-id");
+      if (id && /^\d{10,}$/.test(id)) return id;
+    }
+
+    // 2. 当前播放器所在的容器往上找
+    const v = document.querySelector("video");
+    if (v) {
+      let node = v;
+      for (let i = 0; i < 12 && node; i++) {
+        const id =
+          node.getAttribute &&
+          (node.getAttribute("data-video-id") ||
+            node.getAttribute("data-aweme-id"));
+        if (id && /^\d{10,}$/.test(id)) return id;
+        node = node.parentElement;
+      }
+    }
+
+    // 3. 从页面内联脚本里扫 aweme_id（抖音会把数据挂 window 上）
+    try {
+      const html = document.documentElement.innerHTML;
+      let mm = html.match(/"aweme_id"\s*:\s*"(\d{10,})"/);
+      if (mm) return mm[1];
+      mm = html.match(/"awemeId"\s*:\s*"(\d{10,})"/);
+      if (mm) return mm[1];
+      mm = html.match(/\/video\/(\d{15,})/);
+      if (mm) return mm[1];
+    } catch (e) {
+      /* ignore */
+    }
+
+    return null;
+  }
+
+  /** 拿到当前视频的 aweme_id（URL 优先，其次 DOM） */
+  function getAwemeId() {
+    return getAwemeIdFromUrl() || getAwemeIdFromDom() || null;
+  }
+
+  /**
+   * 生成视频唯一 key
+   * 有 aweme_id 就用它（最稳，与从哪进入无关）
+   * 实在拿不到才退回 URL，此时尽量剥离易变参数
+   */
+  function getVideoKey() {
+    const id = getAwemeId();
+    if (id) return "aweme:" + id;
+
+    const url = new URL(location.href);
     url.hash = "";
-    return "url:" + url.origin + url.pathname;
+    // 移除已知的易变跟踪参数
+    const junk = [
+      "from", "from_ssr", "extra_params", "previous_page", "enter_from",
+      "enter_method", "gid", "gd_ext_json", "video_share_track_ver",
+      "schema_type", "share_token", "timestamp", "tt_from", "utm_source",
+    ];
+    junk.forEach((k) => url.searchParams.delete(k));
+    return "url:" + url.origin + url.pathname + url.search;
+  }
+
+  /** 生成可直接打开的视频详情页地址（干净的 /video/<id>） */
+  function getCleanUrl() {
+    const id = getAwemeId();
+    if (id) return "https://www.douyin.com/video/" + id;
+    return location.href;
   }
 
   function getTitle() {
@@ -165,7 +256,8 @@
 
     const patch = {
       title: getTitle(),
-      url: location.href,
+      url: getCleanUrl(),
+      awemeId: getAwemeId() || "",
       currentTime: v.currentTime,
       duration: v.duration,
       updatedAt: now,
@@ -179,28 +271,111 @@
 
   /* ---------------- 续看逻辑 ---------------- */
 
-  let pendingResume = null; // {key, time}
+  let pendingResume = null; // {key, awemeId, time, at}
 
   async function tryResume() {
     if (!pendingResume) return;
+
+    // 超时作废（1 分钟）
+    if (pendingResume.at && Date.now() - pendingResume.at > 60000) {
+      clearPending();
+      return;
+    }
+
     const v = findVideo();
     if (!v) return;
     if (!isFinite(v.duration) || v.duration <= 0) return;
+    if (v.readyState < 1) return; // 还没加载元数据
 
-    const key = getVideoKey();
-    if (key !== pendingResume.key) return;
+    // 匹配：优先 awemeId，其次 key
+    const curId = getAwemeId();
+    const curKey = getVideoKey();
+    const idMatch = pendingResume.awemeId && curId && pendingResume.awemeId === curId;
+    const keyMatch = !pendingResume.awemeId && curKey === pendingResume.key;
+    const fallbackKey = curKey === pendingResume.key;
 
-    const target = Math.min(pendingResume.time, v.duration - 1);
+    if (!idMatch && !keyMatch && !fallbackKey) return;
+
+    const target = Math.min(pendingResume.time, Math.max(0, v.duration - 1));
     if (target <= 0) {
-      pendingResume = null;
+      clearPending();
       return;
     }
     try {
       v.currentTime = target;
-      pendingResume = null;
+      clearPending();
       toast("已跳到 " + fmtTime(target) + "，接着看吧");
     } catch (e) {
       /* 忽略 */
+    }
+  }
+
+  function clearPending() {
+    pendingResume = null;
+    try {
+      chrome.storage.local.remove("dyrs_pending");
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  /* ---------------- 记录迁移（修复旧版本存的坏数据） ---------------- */
+
+  async function migrateRecords() {
+    const records = await readRecords();
+    if (!records.length) return;
+
+    let changed = false;
+    const seen = new Map();
+
+    for (const r of records) {
+      if (!r || !r.url) continue;
+
+      // 1. 从 url 里补出 awemeId
+      let aid = r.awemeId || "";
+      if (!aid && r.url) {
+        const m1 = r.url.match(/\/video\/(\d{10,})/);
+        if (m1) aid = m1[1];
+        if (!aid) {
+          const m2 = r.url.match(/[?&](?:modal_id|aweme_id)=(\d{10,})/);
+          if (m2) aid = m2[1];
+        }
+        if (aid) {
+          r.awemeId = aid;
+          r.key = "aweme:" + aid;
+          changed = true;
+        }
+      }
+
+      // 2. URL 是首页或带参数的，且已有 awemeId → 换成干净的详情页
+      if (aid) {
+        const clean = "https://www.douyin.com/video/" + aid;
+        if (r.url !== clean) {
+          r.url = clean;
+          changed = true;
+        }
+      }
+
+      // 3. 去重：同一个 awemeId 只保留进度最靠后（最近更新）的一条
+      const dedupKey = aid ? "aweme:" + aid : r.key;
+      if (seen.has(dedupKey)) {
+        const prev = seen.get(dedupKey);
+        const keep = (r.updatedAt || 0) > (prev.updatedAt || 0) ? r : prev;
+        const drop = keep === r ? prev : r;
+        const idx = records.indexOf(drop);
+        if (idx >= 0) {
+          records.splice(idx, 1);
+          changed = true;
+        }
+        seen.set(dedupKey, keep);
+        continue;
+      }
+      seen.set(dedupKey, r);
+    }
+
+    if (changed) {
+      records.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      await writeRecords(records);
     }
   }
 
@@ -371,9 +546,36 @@
             return;
           }
         }
-        if (r.url) {
+
+        // 需要跳转到视频页：把续看信息写进 storage，供新页面读取
+        let dest = cur.url || r.url;
+        // 旧记录可能存的是带参数的首页地址，用 awemeId 兜底重建
+        const aid = cur.awemeId || r.awemeId;
+        if (aid) {
+          dest = "https://www.douyin.com/video/" + aid;
+        }
+        if (!dest) {
+          toast("这条记录没有可跳转的地址");
+          return;
+        }
+
+        try {
+          chrome.storage.local.set(
+            {
+              dyrs_pending: {
+                key: r.key,
+                awemeId: aid || "",
+                time: target,
+                at: Date.now(),
+              },
+            },
+            () => {
+              location.href = dest;
+            }
+          );
+        } catch (e) {
           pendingResume = { key: r.key, time: target };
-          location.href = r.url;
+          location.href = dest;
         }
       });
 
@@ -403,9 +605,17 @@
     try {
       chrome.storage.local.get("dyrs_pending", (res) => {
         const p = res && res.dyrs_pending;
-        if (!p || !p.key || !p.time) return;
-        if (Date.now() - (p.at || 0) > 60000) return; // 超过 1 分钟作废
-        pendingResume = { key: p.key, time: p.time };
+        if (!p || !p.time) return;
+        if (Date.now() - (p.at || 0) > 60000) {
+          chrome.storage.local.remove("dyrs_pending");
+          return;
+        }
+        pendingResume = {
+          key: p.key || "",
+          awemeId: p.awemeId || "",
+          time: p.time,
+          at: p.at,
+        };
       });
     } catch (e) {
       /* ignore */
@@ -414,6 +624,19 @@
 
   buildUI();
   checkPendingResume();
+  migrateRecords().then(() => renderPanel());
+
+  // 抖音是 SPA，路由变化时要重新检查一次待续看并刷新列表
+  let lastHref = location.href;
+  setInterval(() => {
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      checkPendingResume();
+      setTimeout(tryResume, 800);
+      setTimeout(tryResume, 2000);
+      setTimeout(tryResume, 4000);
+    }
+  }, 700);
 
   setInterval(tick, 1000);
   setInterval(tryResume, 1200);
