@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "抖音续看 - 记住看到哪了",
+  "version": "1.0.0",
+  "description": "自动记住抖音网页版长视频的播放位置，下次点一下接着看。支持删除不想看记录。",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.douyin.com/*",
+        "*://*.iesdouyin.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "抖音续看"
+  }
+}
