@@ -19,6 +19,9 @@
 
   const STORAGE_KEY = "dyrs_records";
 
+  // 调试日志：排查「跳错视频」时打开。F12 控制台可看到每个视频实际挖到的 ID
+  const DEBUG = true;
+
   /* ---------------- 工具函数 ---------------- */
 
   function fmtTime(sec) {
@@ -49,62 +52,124 @@
     return null;
   }
 
-  /**
-   * 从页面 DOM 里挖 aweme_id
-   * 抖音会在页面里挂大量 data-e2e 属性和脚本数据
-   */
-  function getAwemeIdFromDom() {
-    // 1. 常见属性
-    const attrs = [
-      "[data-e2e=\"feed-video\"]",
-      "[data-e2e=\"video-item\"]",
-      "[data-e2e=\"recommend-list-item-container\"]",
-      "div[data-video-id]",
-      "[data-aweme-id]",
-    ];
-    for (const sel of attrs) {
-      const el = document.querySelector(sel);
-      if (!el) continue;
-      const id =
-        el.getAttribute("data-video-id") ||
-        el.getAttribute("data-aweme-id") ||
-        el.getAttribute("data-id");
-      if (id && /^\d{10,}$/.test(id)) return id;
-    }
+  const DIGIT_ID = /^\d{15,25}$/;
 
-    // 2. 当前播放器所在的容器往上找
-    const v = document.querySelector("video");
-    if (v) {
-      let node = v;
-      for (let i = 0; i < 12 && node; i++) {
-        const id =
-          node.getAttribute &&
-          (node.getAttribute("data-video-id") ||
-            node.getAttribute("data-aweme-id"));
-        if (id && /^\d{10,}$/.test(id)) return id;
-        node = node.parentElement;
+  /** 在对象里递归找形如 awemeId 的字段（用于读 React fiber 的 props） */
+  function pickAwemeId(o, depth) {
+    if (!o || typeof o !== "object" || depth > 3) return null;
+    const names = [
+      "awemeId", "aweme_id", "awemeid",
+      "itemId", "item_id", "groupId", "group_id",
+    ];
+    for (const n of names) {
+      const val = o[n];
+      if (typeof val === "string" && DIGIT_ID.test(val)) return val;
+      if (typeof val === "number" && String(val).length >= 15) return String(val);
+    }
+    const nest = [
+      "awemeDetail", "aweme", "awemeInfo", "data", "item", "video", "props", "info",
+    ];
+    for (const n of nest) {
+      if (o[n] && typeof o[n] === "object") {
+        const hit = pickAwemeId(o[n], depth + 1);
+        if (hit) return hit;
       }
     }
-
-    // 3. 从页面内联脚本里扫 aweme_id（抖音会把数据挂 window 上）
-    try {
-      const html = document.documentElement.innerHTML;
-      let mm = html.match(/"aweme_id"\s*:\s*"(\d{10,})"/);
-      if (mm) return mm[1];
-      mm = html.match(/"awemeId"\s*:\s*"(\d{10,})"/);
-      if (mm) return mm[1];
-      mm = html.match(/\/video\/(\d{15,})/);
-      if (mm) return mm[1];
-    } catch (e) {
-      /* ignore */
-    }
-
     return null;
   }
 
-  /** 拿到当前视频的 aweme_id（URL 优先，其次 DOM） */
-  function getAwemeId() {
-    return getAwemeIdFromUrl() || getAwemeIdFromDom() || null;
+  /**
+   * 从 React fiber 树上挖 aweme_id —— 从「当前这个 video 元素」出发向上找，
+   * 拿到的才是这个 video 自己的 id，而不是页面里第一个的 id。
+   */
+  function fiberAwemeId(node) {
+    try {
+      let fiber = null;
+      for (const k in node) {
+        if (
+          k.indexOf("__reactFiber$") === 0 ||
+          k.indexOf("__reactInternalInstance$") === 0
+        ) {
+          fiber = node[k];
+          break;
+        }
+      }
+      let depth = 0;
+      while (fiber && depth < 40) {
+        const hit = pickAwemeId(fiber.memoizedProps, 0);
+        if (hit) return hit;
+        fiber = fiber.return;
+        depth++;
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return null;
+  }
+
+  /** 从 video 元素的祖先容器里挖（只在这一小片 DOM 里找，绝不扫全页） */
+  function digFromContainer(v) {
+    let node = v;
+    for (let i = 0; i < 12 && node; i++) {
+      if (node.getAttribute) {
+        for (const a of ["data-aweme-id", "data-video-id", "data-id"]) {
+          const val = node.getAttribute(a);
+          if (val && /^\d{10,}$/.test(val)) return val;
+        }
+        const href = node.getAttribute("href");
+        if (href) {
+          const m = href.match(/\/video\/(\d{10,})/);
+          if (m) return m[1];
+        }
+      }
+      if (node.querySelector) {
+        const link = node.querySelector('a[href*="/video/"]');
+        if (link) {
+          const m = (link.getAttribute("href") || "").match(/\/video\/(\d{10,})/);
+          if (m) return m[1];
+        }
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  /** 算某个 video 对应的 aweme_id */
+  function computeAwemeId(v) {
+    // 1. 详情页 URL 里的 /video/<id> 最可靠
+    const m = location.pathname.match(/\/video\/(\d+)/);
+    if (m) return m[1];
+
+    // 2. 从「这个 video 元素」出发挖。
+    //    优先于 URL 上的 modal_id —— 首页滑动切换视频时 URL 可能还停在上一个视频上
+    if (v) {
+      const f = fiberAwemeId(v);
+      if (f) return f;
+      const d = digFromContainer(v);
+      if (d) return d;
+    }
+
+    // 3. 最后才用 URL 上的 modal_id 等参数
+    return getAwemeIdFromUrl() || null;
+  }
+
+  // 缓存：同一个 video 元素 + 同一个 src 只挖一次（fiber 遍历有开销）
+  let idCache = { el: null, src: null, id: null };
+
+  /** 拿到当前正在看的视频的 aweme_id */
+  function getAwemeId(v) {
+    const el = v || findVideo();
+    if (!el) return computeAwemeId(null);
+    const s = el.currentSrc || el.src || "";
+    if (idCache.el === el && idCache.src === s) return idCache.id;
+    const id = computeAwemeId(el);
+    idCache = { el: el, src: s, id: id };
+    if (DEBUG) {
+      console.log(
+        "[抖音续看] video.src=" + s.slice(0, 80) + " → awemeId=" + id
+      );
+    }
+    return id;
   }
 
   /**
@@ -112,8 +177,8 @@
    * 有 aweme_id 就用它（最稳，与从哪进入无关）
    * 实在拿不到才退回 URL，此时尽量剥离易变参数
    */
-  function getVideoKey() {
-    const id = getAwemeId();
+  function getVideoKey(v) {
+    const id = getAwemeId(v);
     if (id) return "aweme:" + id;
 
     const url = new URL(location.href);
@@ -129,8 +194,8 @@
   }
 
   /** 生成可直接打开的视频详情页地址（干净的 /video/<id>） */
-  function getCleanUrl() {
-    const id = getAwemeId();
+  function getCleanUrl(v) {
+    const id = getAwemeId(v);
     if (id) return "https://www.douyin.com/video/" + id;
     return location.href;
   }
@@ -201,16 +266,36 @@
     return author ? author + "《" + title + "》" : "《" + title + "》";
   }
 
+  /** 元素是否在视口内且够大（抖音首页会预加载多个 video，必须挑到真正在看的那个） */
+  function inViewport(v) {
+    if (!v || !v.getBoundingClientRect) return false;
+    const r = v.getBoundingClientRect();
+    if (r.width < 60 || r.height < 60) return false;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    return r.bottom > 0 && r.top < vh;
+  }
+
   function findVideo() {
     const vids = Array.from(document.querySelectorAll("video"));
     if (!vids.length) return null;
-    // 选正在播放的，其次选时长最长的
-    const playing = vids.find((v) => !v.paused && v.currentTime > 0);
-    if (playing) return playing;
+
+    // 1. 视口内 + 正在播放 → 最可能就是"我此刻在看的那一个"
+    let v = vids.find((x) => inViewport(x) && !x.paused && x.currentTime > 0);
+    if (v) return v;
+
+    // 2. 视口内 + 有有效时长
+    v = vids.find((x) => inViewport(x) && isFinite(x.duration) && x.duration > 0);
+    if (v) return v;
+
+    // 3. 退而求其次：任何正在播放的
+    v = vids.find((x) => !x.paused && x.currentTime > 0);
+    if (v) return v;
+
+    // 4. 最后：时长最长的
     let best = null;
-    for (const v of vids) {
-      if (!isFinite(v.duration) || v.duration <= 0) continue;
-      if (!best || v.duration > best.duration) best = v;
+    for (const x of vids) {
+      if (!isFinite(x.duration) || x.duration <= 0) continue;
+      if (!best || x.duration > best.duration) best = x;
     }
     return best || vids[0];
   }
@@ -291,7 +376,16 @@
     // 太短的视频不记
     if (v.duration < CONFIG.MIN_DURATION) return;
 
-    const key = getVideoKey();
+    // 定位不到视频 ID、又不在详情页 → 记了也跳不回来，宁可不记（避免又存一条跳错的）
+    const aid = getAwemeId(v);
+    if (!aid && !/\/video\/\d+/.test(location.pathname)) {
+      if (DEBUG) {
+        console.warn("[抖音续看] 定位不到视频 ID，本次不记录（避免记错视频）");
+      }
+      return;
+    }
+
+    const key = getVideoKey(v);
     const ratio = v.currentTime / v.duration;
 
     // 快看完了 → 自动移除记录（不用再续看）
@@ -314,8 +408,8 @@
     const patch = {
       title: getMeta(key).title,
       author: getMeta(key).author,
-      url: getCleanUrl(),
-      awemeId: getAwemeId() || "",
+      url: getCleanUrl(v),
+      awemeId: aid || "",
       currentTime: v.currentTime,
       duration: v.duration,
       updatedAt: now,
@@ -346,8 +440,8 @@
     if (v.readyState < 1) return; // 还没加载元数据
 
     // 匹配：优先 awemeId，其次 key
-    const curId = getAwemeId();
-    const curKey = getVideoKey();
+    const curId = getAwemeId(v);
+    const curKey = getVideoKey(v);
     const idMatch = pendingResume.awemeId && curId && pendingResume.awemeId === curId;
     const keyMatch = !pendingResume.awemeId && curKey === pendingResume.key;
     const fallbackKey = curKey === pendingResume.key;
@@ -597,16 +691,21 @@
         const target = Math.max(0, (cur.currentTime || 0) - CONFIG.RESUME_AHEAD);
         const label = formatLabel(cur);
 
-        if (getVideoKey() === r.key) {
-          // 当前就是这个视频，直接跳
-          const v = findVideo();
-          if (v) {
-            v.currentTime = target;
-            v.play().catch(() => {});
-            toast(label + " · 已跳到 " + fmtTime(target));
-            togglePanel(false);
-            return;
-          }
+        // 判断"当前页面是不是就在放这条记录的视频"
+        const nowVideo = findVideo();
+        const nowId = getAwemeId(nowVideo);
+        const nowKey = getVideoKey(nowVideo);
+        const sameVideo =
+          (!!cur.awemeId && !!nowId && cur.awemeId === nowId) ||
+          (!!nowKey && nowKey === r.key);
+
+        if (sameVideo && nowVideo) {
+          // 就是这个视频，原地跳进度
+          nowVideo.currentTime = target;
+          nowVideo.play().catch(() => {});
+          toast(label + " · 已跳到 " + fmtTime(target));
+          togglePanel(false);
+          return;
         }
 
         // 需要跳转到视频页：把续看信息写进 storage，供新页面读取
