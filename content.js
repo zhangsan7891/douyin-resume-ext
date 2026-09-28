@@ -135,27 +135,72 @@
     return location.href;
   }
 
-  function getTitle() {
-    // 1. 抖音视频页标题一般在 og:title 或 document.title
-    const og = document.querySelector('meta[property="og:title"]');
-    if (og && og.content && og.content.trim()) return og.content.trim();
+  /** 取作者昵称 */
+  function getAuthor() {
+    // 1. data-e2e 选择器（抖音网页版常用）
+    const sels = [
+      '[data-e2e="video-author-name"]',
+      '[data-e2e="detail-video-author-name"]',
+      '[data-e2e="video-author"] [data-e2e="user-name"]',
+      '[data-e2e="user-name"]',
+      '[data-e2e="user-info"] span',
+      ".author-name",
+      ".user-name",
+    ];
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      if (!el) continue;
+      const t = (el.textContent || "").trim().replace(/^@/, "");
+      if (t && t.length <= 30 && !/^\d+$/.test(t) && t !== "抖音") return t;
+    }
 
+    // 2. 从页面内联数据里扫 nickname
+    try {
+      const html = document.documentElement.innerHTML;
+      const m =
+        html.match(/"nickname"\s*:\s*"([^"\\]{1,30})"/) ||
+        html.match(/"author"\s*:\s*\{[^}]*"nickname"\s*:\s*"([^"\\]{1,30})"/);
+      if (m && m[1]) return m[1].trim();
+    } catch (e) {
+      /* ignore */
+    }
+
+    return "";
+  }
+
+  /** 取视频标题（优先用视频描述，避免混入作者名） */
+  function getTitle() {
+    // 1. 视频描述（最准）
+    const desc = document.querySelector(
+      '[data-e2e="video-desc"], [data-e2e="detail-video-desc"], [data-e2e="video-title"]'
+    );
+    if (desc) {
+      const t = (desc.textContent || "").trim();
+      if (t) return t.slice(0, 80);
+    }
+
+    // 2. og:title
+    const og = document.querySelector('meta[property="og:title"]');
+    if (og && og.content && og.content.trim()) {
+      return og.content.trim().slice(0, 80);
+    }
+
+    // 3. document.title，去掉尾部的"- 抖音"
     const t = (document.title || "").trim();
     if (t && t !== "抖音" && !/^抖音\s*[-—]/.test(t)) {
-      return t.replace(/\s*[-—]\s*抖音.*$/, "").trim();
+      return t.replace(/\s*[-—]\s*抖音.*$/, "").trim().slice(0, 80);
     }
 
-    // 2. 找页面里的描述文本
-    const desc = document.querySelector(
-      '[data-e2e="video-desc"], [data-e2e="detail-video-desc"]'
-    );
-    if (desc && desc.textContent.trim()) {
-      return desc.textContent.trim().slice(0, 60);
-    }
-
-    if (t) return t.replace(/\s*[-—]\s*抖音.*$/, "").trim() || "抖音视频";
     return "抖音视频";
   }
+
+  /** 拼成 "作者名《视频标题》" 的展示文案 */
+  function formatLabel(r) {
+    const title = (r && r.title) || "抖音视频";
+    const author = (r && r.author) || "";
+    return author ? author + "《" + title + "》" : "《" + title + "》";
+  }
+
   function findVideo() {
     const vids = Array.from(document.querySelectorAll("video"));
     if (!vids.length) return null;
@@ -225,6 +270,18 @@
   let lastSavedAt = 0;
   let lastKey = null;
 
+  // 标题/作者缓存：只在切换视频时重新抓取，避免每 4 秒扫一遍 DOM
+  let metaKey = null;
+  let metaVal = { title: "", author: "" };
+
+  function getMeta(key) {
+    if (metaKey !== key) {
+      metaVal = { title: getTitle(), author: getAuthor() };
+      metaKey = key;
+    }
+    return metaVal;
+  }
+
   async function tick() {
     const v = findVideo();
     if (!v) return;
@@ -255,7 +312,8 @@
     if (key === lastKey && now - lastSavedAt < CONFIG.SAVE_INTERVAL) return;
 
     const patch = {
-      title: getTitle(),
+      title: getMeta(key).title,
+      author: getMeta(key).author,
       url: getCleanUrl(),
       awemeId: getAwemeId() || "",
       currentTime: v.currentTime,
@@ -303,8 +361,11 @@
     }
     try {
       v.currentTime = target;
+      const label = pendingResume.label || "";
       clearPending();
-      toast("已跳到 " + fmtTime(target) + "，接着看吧");
+      toast(
+        (label ? label + " · " : "") + "已跳到 " + fmtTime(target) + "，接着看吧"
+      );
     } catch (e) {
       /* 忽略 */
     }
@@ -497,8 +558,8 @@
 
       const title = document.createElement("div");
       title.className = "dyrs-item-title";
-      title.textContent = r.title || "抖音视频";
-      title.title = r.title || "";
+      title.textContent = formatLabel(r);
+      title.title = formatLabel(r);
 
       const bar = document.createElement("div");
       bar.className = "dyrs-item-bar";
@@ -534,6 +595,7 @@
         const recs = await readRecords();
         const cur = recs.find((x) => x.key === r.key) || r;
         const target = Math.max(0, (cur.currentTime || 0) - CONFIG.RESUME_AHEAD);
+        const label = formatLabel(cur);
 
         if (getVideoKey() === r.key) {
           // 当前就是这个视频，直接跳
@@ -541,7 +603,7 @@
           if (v) {
             v.currentTime = target;
             v.play().catch(() => {});
-            toast("已跳到 " + fmtTime(target));
+            toast(label + " · 已跳到 " + fmtTime(target));
             togglePanel(false);
             return;
           }
@@ -566,6 +628,7 @@
                 key: r.key,
                 awemeId: aid || "",
                 time: target,
+                label: label,
                 at: Date.now(),
               },
             },
@@ -574,7 +637,7 @@
             }
           );
         } catch (e) {
-          pendingResume = { key: r.key, time: target };
+          pendingResume = { key: r.key, time: target, label: label };
           location.href = dest;
         }
       });
@@ -614,6 +677,7 @@
           key: p.key || "",
           awemeId: p.awemeId || "",
           time: p.time,
+          label: p.label || "",
           at: p.at,
         };
       });
