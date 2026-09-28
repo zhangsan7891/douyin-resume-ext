@@ -48,7 +48,7 @@
 **方式二：克隆**
 
 ```bash
-git clone https://github.com/<你的用户名>/douyin-resume-ext.git
+git clone https://github.com/zhangsan7891/douyin-resume-ext.git
 ```
 
 然后同样按上面的 2~5 步加载。
