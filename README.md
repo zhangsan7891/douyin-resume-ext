@@ -48,7 +48,7 @@
 **方式二：克隆**
 
 ```bash
-git clone https://github.com/zhangsan7891/douyin-resume-ext.git
+git clone https://github.com/<你的用户名>/douyin-resume-ext.git
 ```
 
 然后同样按上面的 2~5 步加载。
@@ -59,7 +59,7 @@ git clone https://github.com/zhangsan7891/douyin-resume-ext.git
 
 | 规则 | 阈值 | 原因 |
 |---|---|---|
-| 只记长视频 | ≥ 90 秒 | 短视频刷过去的没必要记 |
+| 只记长视频 | ≥ 30 秒 | 短视频刷过去的没必要记 |
 | 看够才记 | ≥ 3% | 一进去就划走的不记 |
 | 看完自动清 | ≥ 95% | 都看完了，不需要续看 |
 | 存储上限 | 100 条 | 超出自动淘汰最旧的 |
@@ -68,15 +68,18 @@ git clone https://github.com/zhangsan7891/douyin-resume-ext.git
 
 ## 隐私
 
-- 数据存在浏览器本地 `chrome.storage.local`，**不上传、不联网**
+- 记录存在浏览器本地 `chrome.storage.local`，**不上传、不联网**
 - 扩展只申请了 `storage` 一个权限
+- 为了拿到视频 ID，会读取抖音自己的接口响应，但**只读不改**：
+  不伪造、不阻断、不篡改任何请求，也不把这些数据发往任何地方
 - 没有统计、没有埋点、没有远程代码
 - 卸载扩展即清除全部数据
 
 ## 已知限制
 
 - **只支持电脑浏览器**。手机抖音 App 是原生应用，任何浏览器扩展都伸不进去，这是物理限制。
-- 抖音网页版偶尔改版，若出现不记录 / 标题为空，欢迎提 Issue。
+- 抖音网页版偶尔改版（接口或 DOM），若出现不记录 / 标题为空，
+  点面板的「诊断」把报告贴进 Issue，一般能很快适配。
 - 暂不支持拖动悬浮球位置。
 - 悬浮球在抖音全屏播放时可能被遮挡。
 
@@ -84,17 +87,116 @@ git clone https://github.com/zhangsan7891/douyin-resume-ext.git
 
 ```
 douyin-resume-ext/
-├── manifest.json     扩展配置（Manifest V3）
-├── content.js        核心逻辑：进度记录 + 悬浮球 UI
-├── content.css       样式
-├── icons/            图标
-├── README.md         本文件
-└── LICENSE           MIT
+├── manifest.json        扩展配置（Manifest V3）
+├── early.js             document_start 注入器（把 inject.js 送进页面主世界）
+├── inject.js            网络拦截：从抖音自己的接口里取 aweme_id / 文案 / 作者
+├── content.js           核心逻辑：进度记录 + 悬浮球 UI + 诊断
+├── content.css          样式
+├── icons/               图标
+├── README.md            本文件
+├── LICENSE              MIT
+├── 调试指南.md           出问题时的排查手册
+└── GitHub更新操作.md     往 GitHub 同步的操作步骤
 ```
 
 改完文件后，去 `chrome://extensions` 点该扩展的**刷新**，再刷新抖音页面即生效。
 
+## 它是怎么认出「你在看哪个视频」的
+
+这是整个扩展唯一有难度的地方，值得单独说明。
+
+抖音网页版有两种浏览方式，难度完全不同：
+
+**① 详情页**（`douyin.com/video/7123456789...`）
+URL 里就有视频 ID，直接读，毫无难度。
+
+**② 首页推荐流**（`douyin.com/?recommend=1`）—— 难点在这
+实测发现，这种情况下**三条常规路子全部走不通**：
+
+| 路子 | 为什么不行 |
+|---|---|
+| URL | 永远停在 `?recommend=1`，滑到哪都不变 |
+| `video.src` | 是 `blob:https://www.douyin.com/<随机UUID>`，**每次加载页面都换一个**，完全不可追踪 |
+| DOM 属性 | 视频卡片上不挂 `aweme_id`，也没有 `/video/` 链接 |
+
+所以在推荐流里，光靠「看页面」是不可能知道当前是哪个视频的。
+
+**解决办法：拦抖音自己的接口。**
+
+视频 ID、文案、作者本来就在抖音向自己服务器请求的数据里，扩展只需要**读它已经收到的响应**：
+
+```
+inject.js（运行在页面主世界）
+   └─ 包装 fetch / XMLHttpRequest，只截获 /aweme/v1/ 的响应
+   └─ 从 JSON 里递归取出每个 aweme 的 {id, desc, author}
+   └─ 通过 window.postMessage 交给扩展
+
+content.js（扩展世界）
+   └─ 读出「当前 video 所在卡片里的视频文案」
+   └─ 用文案去索引里匹配 → 得到真实 aweme_id
+   └─ 存下 douyin.com/video/<id>，续看时精确跳回
+```
+
+它**不发任何网络请求**，不修改页面行为，只是读取页面本来就收到的数据。
+
 ## 更新日志
+
+### v1.3.0
+
+修复「首页推荐流里完全记不到视频」的问题。**这是架构级的改动。**
+
+**根因**（v1.2.x 全部失效的原因）：
+
+首页推荐流（`douyin.com/?recommend=1`）里，三条常规识别路径全部走不通：
+
+1. URL 永远是 `?recommend=1`，滑动切换视频时**地址栏不变**
+2. `video.src` 是 `blob:https://www.douyin.com/<随机UUID>`，
+   **每次页面加载都重新生成**，拿它当标识等于每次给同一视频发新身份证
+3. 视频卡片的 DOM 上不挂 `aweme_id`，也没有 `/video/` 链接
+
+→ 结论：推荐流里，光靠 DOM 和 URL，**物理上拿不到任何视频标识**。
+
+**修复**：
+
+- 新增 `inject.js`：注入页面主世界，只读地截获抖音自己的
+  `/aweme/v1/` 接口响应，提取 `{aweme_id, desc, author}`
+- 新增 `early.js`：在 `document_start` 就把 `inject.js` 送进页面，
+  避免错过第一批请求；`content.js` 启动后主动补拉一次历史数据
+- 用**视频文案**做桥梁：DOM 上读文案 → 在接口数据里匹配 → 换回真实 ID
+- `getVideoKey` 兜底链重排：`aweme_id` → **文案** → URL → src 指纹
+  （去掉了把 blob src 当主兜底的做法，它根本不稳定）
+- 记录门槛从 90 秒降到 **30 秒**
+- 诊断报告新增「接口数据」与「DOM 侦察」两段
+
+**为什么不用 `"world": "MAIN"` 声明**：那个字段要 Chromium 111+ 才认，
+写错会导致整个扩展加载失败。改用 `web_accessible_resources` + script 标签注入，
+兼容性更好，效果一样。
+
+### v1.2.2
+
+修复「看了视频但列表里没有新记录」的问题——这是 v1.2.1 引入的回归。
+
+**根因（两个错误叠加）**：
+
+1. v1.2.1 为了保证"不跳错"，加了「挖不到视频 ID 就不记录」的逻辑。方向是错的：
+   一旦 ID 挖不到，整个记录功能就会**静默失效**，比偶尔跳错更糟。
+2. 而挖 ID 用的属性名和容器名**本身就是猜错的**，所以基本一定挖不到：
+   - 属性用了 `data-aweme-id`，抖音实际用的是 **`data-e2e-aweme-id`**
+   - 没有识别抖音的播放器容器 **`xg-video-container`**
+   - 漏掉了 SSR 内联数据（`window._ROUTER_DATA`、`#RENDER_DATA`）
+
+**修复**：
+
+- **拿不到 ID 也照记**：新增 `video.src` 指纹作为兜底唯一标识，保证"只要有视频在播就一定记下来"
+- 补全 ID 挖掘渠道，共六级：URL 详情页 → React fiber → 播放器容器 → 逐级向上属性
+  → SSR 数据 → URL 参数
+- 属性表补上 `data-e2e-aweme-id`、`data-item-id`、`data-e2e-video-id`
+- 新增 `xg-video-container` 等容器识别
+- 逐级向上时**只读元素自身属性**，不再 `querySelector` 扫子元素——
+  这是"跳错视频"的真正来源（会串到同页面其它视频卡片）
+- SSR 数据仅在「页面只有一个 video」时使用，避免信息流里取到别的视频
+- 面板新增**「诊断」按钮**：点一下列出页面所有 video 的状态、
+  六级 ID 探测的逐项结果、当前 key 与已存记录，同时打印到控制台
 
 ### v1.2.1
 
@@ -109,7 +211,8 @@ douyin-resume-ext/
 - 改为以「当前正在播放的 video 元素」为锚点挖 ID，不再扫全页
 - 三级挖掘：React fiber 树（最准）→ 祖先容器属性/链接 → URL 参数
 - `findVideo()` 增加「视口内优先」，避免选中预加载的隐藏 video
-- 挖不到 ID 时宁可不记录，不再存一条注定跳错的记录
+- ~~挖不到 ID 时宁可不记录~~ —— **v1.2.2 已推翻这个决定**：
+  它会导致功能静默失效，改为用 `video.src` 指纹兜底照常记录
 - 新增 `DEBUG` 日志（F12 控制台可见 `[抖音续看]` 前缀），便于排查
 
 > ⚠️ v1.2.0 及更早版本存的记录里，ID 可能就是错的。升级后建议点面板上的「清空」，重新积累。

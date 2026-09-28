@@ -76,16 +76,40 @@
   font-size: 13px;
   font-weight: 500;
 }
-#dyrs-clear {
+#dyrs-head-right {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+#dyrs-clear,
+#dyrs-diag {
   font-size: 12px;
   color: #9aa0ae;
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 4px;
 }
-#dyrs-clear:hover {
+#dyrs-clear:hover,
+#dyrs-diag:hover {
   color: #fe2c55;
   background: rgba(254, 44, 85, 0.1);
+}
+
+/* 诊断报告 */
+#dyrs-diag-box {
+  padding: 10px;
+  font-size: 11px;
+  line-height: 1.7;
+  color: #c9cdd6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: Consolas, Monaco, Menlo, monospace;
+}
+#dyrs-diag-box .ok {
+  color: #4ade80;
+}
+#dyrs-diag-box .bad {
+  color: #fe2c55;
 }
 #dyrs-list {
   overflow-y: auto;
